@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, GitHub, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -339,6 +339,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec choose_issues_for_test([Issue.t()], term()) :: term()
+  def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    choose_issues(issues, state)
+  end
+
+  def choose_issues_for_test(issues, state) when is_list(issues) do
+    choose_issues(issues, state)
+  end
+
+  @doc false
+  @spec reconcile_passive_issue_states_for_test([Issue.t()], term()) :: term()
+  def reconcile_passive_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
+    reconcile_passive_issue_states(
+      issues,
+      state,
+      active_state_set(),
+      passive_state_set(),
+      terminal_state_set()
+    )
+  end
+
+  def reconcile_passive_issue_states_for_test(issues, state) when is_list(issues) do
+    reconcile_passive_issue_states(
+      issues,
+      state,
+      active_state_set(),
+      passive_state_set(),
+      terminal_state_set()
+    )
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
@@ -454,7 +486,7 @@ defmodule SymphonyElixir.Orchestrator do
         untrack_passive_issue(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
-        untrack_passive_issue(state, issue.id)
+        reconcile_active_passive_issue_state(issue, state)
 
       passive_issue_state?(issue.state, passive_states) ->
         refresh_passive_issue_state(state, issue)
@@ -467,6 +499,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_passive_issue_state(_issue, state, _active_states, _passive_states, _terminal_states),
     do: state
+
+  defp reconcile_active_passive_issue_state(%Issue{} = issue, %State{} = state) do
+    case Map.get(state.passive, issue.id) do
+      %{wait_reason: "checks_pending"} = passive_entry ->
+        case pending_pr_checks(issue, passive_entry) do
+          {:pending, workspace_path} ->
+            refresh_passive_issue_state(state, issue, %{
+              wait_reason: "checks_pending",
+              workspace_path: workspace_path
+            })
+
+          :clear ->
+            Logger.info("Passive checks-pending wait settled: #{issue_context(issue)}; re-entering active dispatch flow")
+
+            untrack_passive_issue(state, issue.id)
+
+          {:error, reason} ->
+            Logger.debug("Failed refreshing passive checks-pending wait for #{issue_context(issue)}: #{inspect(reason)}; resuming active dispatch flow")
+
+            untrack_passive_issue(state, issue.id)
+        end
+
+      _ ->
+        untrack_passive_issue(state, issue.id)
+    end
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -547,18 +605,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_passive_issue_state(%State{} = state, %Issue{} = issue) do
+    refresh_passive_issue_state(state, issue, %{})
+  end
+
+  defp refresh_passive_issue_state(%State{} = state, %Issue{} = issue, metadata)
+       when is_map(metadata) do
     case Map.get(state.passive, issue.id) do
       %{identifier: identifier} = passive_entry ->
         updated_passive =
           passive_entry
           |> Map.put(:issue, issue)
           |> Map.put(:identifier, identifier || issue.identifier)
-          |> Map.put(:wait_reason, passive_wait_reason(issue.state))
+          |> Map.put(:worker_host, metadata[:worker_host] || Map.get(passive_entry, :worker_host))
+          |> Map.put(
+            :workspace_path,
+            metadata[:workspace_path] || Map.get(passive_entry, :workspace_path)
+          )
+          |> Map.put(
+            :wait_reason,
+            metadata[:wait_reason] || Map.get(passive_entry, :wait_reason) ||
+              passive_wait_reason(issue.state)
+          )
 
         %{state | passive: Map.put(state.passive, issue.id, updated_passive)}
 
       _ ->
-        register_passive_issue(state, issue)
+        register_passive_issue(state, issue, metadata)
     end
   end
 
@@ -673,20 +745,30 @@ defmodule SymphonyElixir.Orchestrator do
 
     issues
     |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      cond do
-        should_track_passive_issue?(issue, state_acc, passive_states, terminal_states) ->
-          register_passive_issue(state_acc, issue)
+    |> Enum.reduce(state, &choose_issue(&1, &2, active_states, passive_states, terminal_states))
+  end
 
-        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
-          state_acc
-          |> untrack_passive_issue(issue.id)
-          |> dispatch_issue(issue)
+  defp choose_issue(issue, state, active_states, passive_states, terminal_states) do
+    if should_track_passive_issue?(issue, state, passive_states, terminal_states) do
+      register_passive_issue(state, issue)
+    else
+      issue
+      |> maybe_track_checks_pending_issue(state, active_states, terminal_states)
+      |> maybe_dispatch_issue(issue, state, active_states, terminal_states)
+    end
+  end
 
-        true ->
-          state_acc
-      end
-    end)
+  defp maybe_dispatch_issue({:tracked, updated_state}, _issue, _state, _active_states, _terminal_states),
+    do: updated_state
+
+  defp maybe_dispatch_issue(:noop, issue, state, active_states, terminal_states) do
+    if should_dispatch_issue?(issue, state, active_states, terminal_states) do
+      state
+      |> untrack_passive_issue(issue.id)
+      |> dispatch_issue(issue)
+    else
+      state
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -739,6 +821,40 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_track_passive_issue?(_issue, _state, _passive_states, _terminal_states), do: false
+
+  defp maybe_track_checks_pending_issue(
+         %Issue{} = issue,
+         %State{running: running, passive: passive, claimed: claimed, retry_attempts: retry_attempts} =
+           state,
+         active_states,
+         terminal_states
+       ) do
+    if candidate_issue?(issue, active_states, terminal_states) and
+         !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+         !MapSet.member?(claimed, issue.id) and
+         !Map.has_key?(running, issue.id) and
+         !Map.has_key?(retry_attempts, issue.id) and
+         !Map.has_key?(passive, issue.id) do
+      case pending_pr_checks(issue, %{}) do
+        {:pending, workspace_path} ->
+          Logger.info("Issue waiting on GitHub checks: #{issue_context(issue)} workspace=#{workspace_path}; waiting without an agent session")
+
+          {:tracked,
+           register_passive_issue(state, issue, %{
+             wait_reason: "checks_pending",
+             workspace_path: workspace_path
+           })}
+
+        _ ->
+          :noop
+      end
+    else
+      :noop
+    end
+  end
+
+  defp maybe_track_checks_pending_issue(_issue, _state, _active_states, _terminal_states),
+    do: :noop
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1050,6 +1166,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
     passive_states = passive_state_set()
+    checks_pending_status = pending_pr_checks(issue, metadata)
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
@@ -1065,6 +1182,19 @@ defmodule SymphonyElixir.Orchestrator do
          state
          |> release_issue_claim(issue_id)
          |> register_passive_issue(issue, metadata)}
+
+      match?({:pending, _}, checks_pending_status) ->
+        {:pending, workspace_path} = checks_pending_status
+
+        Logger.info("Issue waiting on GitHub checks: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state} workspace=#{workspace_path}; waiting without an agent session")
+
+        {:noreply,
+         state
+         |> release_issue_claim(issue_id)
+         |> register_passive_issue(
+           issue,
+           Map.merge(metadata, %{wait_reason: "checks_pending", workspace_path: workspace_path})
+         )}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1139,21 +1269,22 @@ defmodule SymphonyElixir.Orchestrator do
        when is_map(metadata) do
     existing = Map.get(state.passive, issue.id, %{})
     identifier = Map.get(existing, :identifier) || metadata[:identifier] || issue.identifier
-    worker_host = Map.get(existing, :worker_host) || metadata[:worker_host]
+    worker_host = metadata[:worker_host] || Map.get(existing, :worker_host)
 
     workspace_path =
-      Map.get(existing, :workspace_path) ||
-        metadata[:workspace_path] ||
+      metadata[:workspace_path] ||
+        Map.get(existing, :workspace_path) ||
         Path.join(Config.settings!().workspace.root, issue.identifier)
 
     entered_passive_at = Map.get(existing, :entered_passive_at) || DateTime.utc_now()
+    wait_reason = metadata[:wait_reason] || Map.get(existing, :wait_reason) || passive_wait_reason(issue.state)
 
     passive_entry = %{
       issue: issue,
       identifier: identifier,
       worker_host: worker_host,
       workspace_path: workspace_path,
-      wait_reason: passive_wait_reason(issue.state),
+      wait_reason: wait_reason,
       entered_passive_at: entered_passive_at
     }
 
@@ -1203,6 +1334,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp pending_pr_checks(%Issue{} = issue, metadata) when is_map(metadata) do
+    workspace_path = issue_workspace_path(issue, metadata)
+
+    case GitHub.pr_check_status(workspace_path) do
+      {:ok, %{has_pr?: true, pending?: true}} ->
+        {:pending, workspace_path}
+
+      {:ok, _status} ->
+        :clear
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp pending_pr_checks(_issue, _metadata), do: :clear
+
+  defp issue_workspace_path(%Issue{identifier: identifier}, metadata)
+       when is_binary(identifier) and is_map(metadata) do
+    metadata[:workspace_path] || Path.join(Config.settings!().workspace.root, identifier)
+  end
+
+  defp issue_workspace_path(_issue, metadata) when is_map(metadata) do
+    metadata[:workspace_path]
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry

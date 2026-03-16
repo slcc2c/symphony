@@ -1461,6 +1461,241 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner pauses after a turn when GitHub checks are pending" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-checks-pending-#{System.unique_integer([:positive])}"
+      )
+
+    previous_status_fun = Application.get_env(:symphony_elixir, :github_pr_status_fun)
+
+    on_exit(fn ->
+      if is_nil(previous_status_fun) do
+        Application.delete_env(:symphony_elixir, :github_pr_status_fun)
+      else
+        Application.put_env(:symphony_elixir, :github_pr_status_fun, previous_status_fun)
+      end
+    end)
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      parent = self()
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-pending"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-pending"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      Application.put_env(:symphony_elixir, :github_pr_status_fun, fn workspace ->
+        send(parent, {:github_pr_status, workspace})
+        {:ok, %{has_pr?: true, pending?: true}}
+      end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:pending_checks_fetch_count, 0) + 1
+        Process.put(:pending_checks_fetch_count, attempt)
+        send(parent, {:issue_state_fetch, attempt})
+
+        {:ok,
+         [
+           %Issue{
+             id: "issue-checks-pending",
+             identifier: "MT-249",
+             title: "Pause while checks run",
+             description: "Checks are pending",
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-checks-pending",
+        identifier: "MT-249",
+        title: "Pause while checks run",
+        description: "Checks are pending",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+      assert_receive {:issue_state_fetch, 1}
+      refute_receive {:issue_state_fetch, 2}, 100
+      assert_receive {:github_pr_status, workspace}
+      assert Path.basename(workspace) == "MT-249"
+
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "orchestrator tracks active issues with pending GitHub checks as passive waits" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-checks-pending-#{System.unique_integer([:positive])}"
+      )
+
+    previous_status_fun = Application.get_env(:symphony_elixir, :github_pr_status_fun)
+
+    on_exit(fn ->
+      if is_nil(previous_status_fun) do
+        Application.delete_env(:symphony_elixir, :github_pr_status_fun)
+      else
+        Application.put_env(:symphony_elixir, :github_pr_status_fun, previous_status_fun)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :github_pr_status_fun, fn workspace ->
+      send(self(), {:github_pr_status, workspace})
+      {:ok, %{has_pr?: true, pending?: true}}
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_passive_states: ["Human Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue = %Issue{
+      id: "issue-checks-pending",
+      identifier: "MT-260",
+      title: "Wait on checks",
+      description: "Checks pending after rework push",
+      state: "Rework"
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      passive: %{},
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state = Orchestrator.choose_issues_for_test([issue], state)
+    workspace = Path.join(test_root, "MT-260")
+
+    assert_receive {:github_pr_status, ^workspace}
+
+    assert %{identifier: "MT-260", wait_reason: "checks_pending", workspace_path: ^workspace} =
+             updated_state.passive["issue-checks-pending"]
+
+    assert updated_state.running == %{}
+  end
+
+  test "orchestrator releases checks-pending waits once GitHub checks settle" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-checks-settle-#{System.unique_integer([:positive])}"
+      )
+
+    previous_status_fun = Application.get_env(:symphony_elixir, :github_pr_status_fun)
+
+    on_exit(fn ->
+      if is_nil(previous_status_fun) do
+        Application.delete_env(:symphony_elixir, :github_pr_status_fun)
+      else
+        Application.put_env(:symphony_elixir, :github_pr_status_fun, previous_status_fun)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :github_pr_status_fun, fn workspace ->
+      send(self(), {:github_pr_status, workspace})
+      {:ok, %{has_pr?: true, pending?: false}}
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+      tracker_passive_states: ["Human Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    workspace = Path.join(test_root, "MT-261")
+    entered_passive_at = DateTime.utc_now()
+
+    issue = %Issue{
+      id: "issue-checks-settle",
+      identifier: "MT-261",
+      title: "Resume after checks",
+      description: "Checks finished",
+      state: "Rework"
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      passive: %{
+        "issue-checks-settle" => %{
+          issue: issue,
+          identifier: "MT-261",
+          wait_reason: "checks_pending",
+          worker_host: nil,
+          workspace_path: workspace,
+          entered_passive_at: entered_passive_at
+        }
+      },
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated_state = Orchestrator.reconcile_passive_issue_states_for_test([issue], state)
+
+    assert_receive {:github_pr_status, ^workspace}
+    refute Map.has_key?(updated_state.passive, "issue-checks-settle")
+  end
+
   test "app server starts with workspace cwd and expected startup command" do
     test_root =
       Path.join(
