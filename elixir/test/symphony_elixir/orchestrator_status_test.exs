@@ -751,6 +751,49 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert due_in_ms > 0
   end
 
+  test "orchestrator snapshot includes passive wait entries" do
+    orchestrator_name = Module.concat(__MODULE__, :PassiveSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    entered_passive_at = DateTime.utc_now()
+    initial_state = :sys.get_state(pid)
+
+    passive_entry = %{
+      identifier: "MT-REVIEW",
+      issue: %Issue{id: "issue-passive", identifier: "MT-REVIEW", state: "Human Review"},
+      wait_reason: "human_review",
+      worker_host: nil,
+      workspace_path: "/tmp/symphony_workspaces/MT-REVIEW",
+      entered_passive_at: entered_passive_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | passive: %{"issue-passive" => passive_entry}}
+    end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert %{
+             passive: [
+               %{
+                 issue_id: "issue-passive",
+                 identifier: "MT-REVIEW",
+                 state: "Human Review",
+                 mode: "passive",
+                 wait_reason: "human_review",
+                 workspace_path: "/tmp/symphony_workspaces/MT-REVIEW",
+                 entered_passive_at: ^entered_passive_at
+               }
+             ]
+           } = snapshot
+  end
+
   test "orchestrator snapshot includes poll countdown and checking status" do
     orchestrator_name = Module.concat(__MODULE__, :PollingSnapshotOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -1052,6 +1095,34 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     checking_rendered = StatusDashboard.format_snapshot_content_for_test(checking_snapshot, 0.0)
     assert checking_rendered =~ "checking now…"
+  end
+
+  test "status dashboard renders passive queue separately from running agents" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         passive: [
+           %{
+             issue_id: "issue-passive",
+             identifier: "MT-REVIEW",
+             state: "Human Review",
+             mode: "passive",
+             wait_reason: "human_review",
+             workspace_path: "/tmp/symphony_workspaces/MT-REVIEW"
+           }
+         ],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "Passive queue"
+    assert rendered =~ "MT-REVIEW"
+    assert rendered =~ "human_review"
+    assert rendered =~ "No active agents"
   end
 
   test "status dashboard adds a spacer line before backoff queue when no agents are active" do

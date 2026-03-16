@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       running: %{},
+      passive: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
@@ -223,10 +224,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
+    state = reconcile_passive_issues(state)
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -266,9 +267,6 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
-
-      false ->
-        state
     end
   end
 
@@ -285,6 +283,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> reconcile_running_issue_states(
             state,
             active_state_set(),
+            passive_state_set(),
             terminal_state_set()
           )
           |> reconcile_missing_running_issue_ids(running_ids, issues)
@@ -300,11 +299,23 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(
+      issues,
+      state,
+      active_state_set(),
+      passive_state_set(),
+      terminal_state_set()
+    )
   end
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(
+      issues,
+      state,
+      active_state_set(),
+      passive_state_set(),
+      terminal_state_set()
+    )
   end
 
   @doc false
@@ -333,18 +344,26 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
-  defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
+  defp reconcile_running_issue_states([], state, _active_states, _passive_states, _terminal_states),
+    do: state
 
-  defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
+  defp reconcile_running_issue_states(
+         [issue | rest],
+         state,
+         active_states,
+         passive_states,
+         terminal_states
+       ) do
     reconcile_running_issue_states(
       rest,
-      reconcile_issue_state(issue, state, active_states, terminal_states),
+      reconcile_issue_state(issue, state, active_states, passive_states, terminal_states),
       active_states,
+      passive_states,
       terminal_states
     )
   end
 
-  defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+  defp reconcile_issue_state(%Issue{} = issue, state, active_states, passive_states, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
@@ -359,6 +378,18 @@ defmodule SymphonyElixir.Orchestrator do
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
+      passive_issue_state?(issue.state, passive_states) ->
+        Logger.info("Issue moved to passive state: #{issue_context(issue)} state=#{issue.state}; stopping active agent and waiting")
+
+        metadata = %{
+          worker_host: state.running |> Map.get(issue.id) |> then(&(&1 && Map.get(&1, :worker_host))),
+          workspace_path: state.running |> Map.get(issue.id) |> then(&(&1 && Map.get(&1, :workspace_path)))
+        }
+
+        state
+        |> terminate_running_issue(issue.id, false)
+        |> register_passive_issue(issue, metadata)
+
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
@@ -366,7 +397,76 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+  defp reconcile_issue_state(_issue, state, _active_states, _passive_states, _terminal_states),
+    do: state
+
+  defp reconcile_passive_issues(%State{} = state) do
+    passive_ids = Map.keys(state.passive)
+
+    if passive_ids == [] do
+      state
+    else
+      case Tracker.fetch_issue_states_by_ids(passive_ids) do
+        {:ok, issues} ->
+          issues
+          |> reconcile_passive_issue_states(
+            state,
+            active_state_set(),
+            passive_state_set(),
+            terminal_state_set()
+          )
+          |> reconcile_missing_passive_issue_ids(passive_ids, issues)
+
+        {:error, reason} ->
+          Logger.debug("Failed to refresh passive issue states: #{inspect(reason)}; keeping passive waits")
+          state
+      end
+    end
+  end
+
+  defp reconcile_passive_issue_states([], state, _active_states, _passive_states, _terminal_states),
+    do: state
+
+  defp reconcile_passive_issue_states(
+         [issue | rest],
+         state,
+         active_states,
+         passive_states,
+         terminal_states
+       ) do
+    reconcile_passive_issue_states(
+      rest,
+      reconcile_passive_issue_state(issue, state, active_states, passive_states, terminal_states),
+      active_states,
+      passive_states,
+      terminal_states
+    )
+  end
+
+  defp reconcile_passive_issue_state(%Issue{} = issue, state, active_states, passive_states, terminal_states) do
+    cond do
+      terminal_issue_state?(issue.state, terminal_states) ->
+        Logger.info("Passive issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; removing passive wait")
+        untrack_passive_issue(state, issue.id)
+
+      !issue_routable_to_worker?(issue) ->
+        Logger.info("Passive issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; removing passive wait")
+        untrack_passive_issue(state, issue.id)
+
+      active_issue_state?(issue.state, active_states) ->
+        untrack_passive_issue(state, issue.id)
+
+      passive_issue_state?(issue.state, passive_states) ->
+        refresh_passive_issue_state(state, issue)
+
+      true ->
+        Logger.info("Passive issue moved to unmanaged state: #{issue_context(issue)} state=#{issue.state}; removing passive wait")
+        untrack_passive_issue(state, issue.id)
+    end
+  end
+
+  defp reconcile_passive_issue_state(_issue, state, _active_states, _passive_states, _terminal_states),
+    do: state
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -390,6 +490,28 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_running_issue_ids(state, _requested_issue_ids, _issues), do: state
 
+  defp reconcile_missing_passive_issue_ids(%State{} = state, requested_issue_ids, issues)
+       when is_list(requested_issue_ids) and is_list(issues) do
+    visible_issue_ids =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
+      if MapSet.member?(visible_issue_ids, issue_id) do
+        state_acc
+      else
+        log_missing_passive_issue(state_acc, issue_id)
+        untrack_passive_issue(state_acc, issue_id)
+      end
+    end)
+  end
+
+  defp reconcile_missing_passive_issue_ids(state, _requested_issue_ids, _issues), do: state
+
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
       %{identifier: identifier} ->
@@ -402,6 +524,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_missing_running_issue(_state, _issue_id), do: :ok
 
+  defp log_missing_passive_issue(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.passive, issue_id) do
+      %{identifier: identifier} ->
+        Logger.info("Passive issue no longer visible during state refresh: issue_id=#{issue_id} issue_identifier=#{identifier}; removing passive wait")
+
+      _ ->
+        Logger.info("Passive issue no longer visible during state refresh: issue_id=#{issue_id}; removing passive wait")
+    end
+  end
+
+  defp log_missing_passive_issue(_state, _issue_id), do: :ok
+
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
@@ -409,6 +543,22 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         state
+    end
+  end
+
+  defp refresh_passive_issue_state(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.passive, issue.id) do
+      %{identifier: identifier} = passive_entry ->
+        updated_passive =
+          passive_entry
+          |> Map.put(:issue, issue)
+          |> Map.put(:identifier, identifier || issue.identifier)
+          |> Map.put(:wait_reason, passive_wait_reason(issue.state))
+
+        %{state | passive: Map.put(state.passive, issue.id, updated_passive)}
+
+      _ ->
+        register_passive_issue(state, issue)
     end
   end
 
@@ -518,15 +668,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
+    passive_states = passive_state_set()
     terminal_states = terminal_state_set()
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        should_track_passive_issue?(issue, state_acc, passive_states, terminal_states) ->
+          register_passive_issue(state_acc, issue)
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+          state_acc
+          |> untrack_passive_issue(issue.id)
+          |> dispatch_issue(issue)
+
+        true ->
+          state_acc
       end
     end)
   end
@@ -568,6 +726,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
 
+  defp should_track_passive_issue?(
+         %Issue{} = issue,
+         %State{running: running, passive: passive, retry_attempts: retry_attempts},
+         passive_states,
+         terminal_states
+       ) do
+    passive_candidate_issue?(issue, passive_states, terminal_states) and
+      !Map.has_key?(running, issue.id) and
+      !Map.has_key?(retry_attempts, issue.id) and
+      !Map.has_key?(passive, issue.id)
+  end
+
+  defp should_track_passive_issue?(_issue, _state, _passive_states, _terminal_states), do: false
+
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
     used = running_issue_count_for_state(running, issue_state)
@@ -606,6 +778,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
+  defp passive_candidate_issue?(
+         %Issue{
+           id: id,
+           identifier: identifier,
+           title: title,
+           state: state_name
+         } = issue,
+         passive_states,
+         terminal_states
+       )
+       when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
+    issue_routable_to_worker?(issue) and
+      passive_issue_state?(state_name, passive_states) and
+      !terminal_issue_state?(state_name, terminal_states)
+  end
+
+  defp passive_candidate_issue?(_issue, _passive_states, _terminal_states), do: false
+
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
        do: assigned_to_worker
@@ -639,6 +829,10 @@ defmodule SymphonyElixir.Orchestrator do
     MapSet.member?(active_states, normalize_issue_state(state_name))
   end
 
+  defp passive_issue_state?(state_name, passive_states) when is_binary(state_name) do
+    MapSet.member?(passive_states, normalize_issue_state(state_name))
+  end
+
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
   end
@@ -652,6 +846,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp active_state_set do
     Config.settings!().tracker.active_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
+  defp passive_state_set do
+    Config.settings!().tracker.passive_states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -827,7 +1028,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -848,6 +1049,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
+    passive_states = passive_state_set()
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
@@ -855,6 +1057,14 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
+
+      passive_candidate_issue?(issue, passive_states, terminal_states) ->
+        Logger.info("Issue state is passive: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; waiting without an agent session")
+
+        {:noreply,
+         state
+         |> release_issue_claim(issue_id)
+         |> register_passive_issue(issue, metadata)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -924,6 +1134,37 @@ defmodule SymphonyElixir.Orchestrator do
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
+
+  defp register_passive_issue(%State{} = state, %Issue{} = issue, metadata \\ %{})
+       when is_map(metadata) do
+    existing = Map.get(state.passive, issue.id, %{})
+    identifier = Map.get(existing, :identifier) || metadata[:identifier] || issue.identifier
+    worker_host = Map.get(existing, :worker_host) || metadata[:worker_host]
+
+    workspace_path =
+      Map.get(existing, :workspace_path) ||
+        metadata[:workspace_path] ||
+        Path.join(Config.settings!().workspace.root, issue.identifier)
+
+    entered_passive_at = Map.get(existing, :entered_passive_at) || DateTime.utc_now()
+
+    passive_entry = %{
+      issue: issue,
+      identifier: identifier,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      wait_reason: passive_wait_reason(issue.state),
+      entered_passive_at: entered_passive_at
+    }
+
+    %{state | passive: Map.put(state.passive, issue.id, passive_entry)}
+  end
+
+  defp untrack_passive_issue(%State{} = state, issue_id) when is_binary(issue_id) do
+    %{state | passive: Map.delete(state.passive, issue_id)}
+  end
+
+  defp untrack_passive_issue(%State{} = state, _issue_id), do: state
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
@@ -1110,6 +1351,7 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           identifier: metadata.identifier,
           state: metadata.issue.state,
+          mode: "active",
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
@@ -1140,9 +1382,27 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    passive =
+      state.passive
+      |> Enum.map(fn {issue_id, passive_entry} ->
+        issue = Map.get(passive_entry, :issue)
+
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(passive_entry, :identifier),
+          state: issue && issue.state,
+          mode: "passive",
+          wait_reason: Map.get(passive_entry, :wait_reason),
+          worker_host: Map.get(passive_entry, :worker_host),
+          workspace_path: Map.get(passive_entry, :workspace_path),
+          entered_passive_at: Map.get(passive_entry, :entered_passive_at)
+        }
+      end)
+
     {:reply,
      %{
        running: running,
+       passive: passive,
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
@@ -1307,6 +1567,18 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
+
+  defp passive_wait_reason(state_name) when is_binary(state_name) do
+    case normalize_issue_state(state_name) do
+      "human review" -> "human_review"
+      "review" -> "human_review"
+      "merging" -> "awaiting_merge_gate"
+      other when other != "" -> String.replace(other, ~r/[^a-z0-9]+/u, "_")
+      _ -> "passive_wait"
+    end
+  end
+
+  defp passive_wait_reason(_state_name), do: "passive_wait"
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)

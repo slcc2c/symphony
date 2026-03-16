@@ -117,7 +117,12 @@ defmodule SymphonyElixir.Linear.Client do
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+          candidate_states =
+            tracker.active_states
+            |> Kernel.++(tracker.passive_states || [])
+            |> Enum.uniq()
+
+          do_fetch_by_states(project_slug, candidate_states, assignee_filter)
         end
     end
   end

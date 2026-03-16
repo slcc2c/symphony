@@ -342,12 +342,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "passive" => 0, "retrying" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
                  "state" => "In Progress",
+                 "mode" => "active",
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
@@ -359,6 +360,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
+             "passive" => [],
              "retrying" => [
                %{
                  "issue_id" => "issue-retry",
@@ -392,6 +394,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
              "running" => %{
+               "mode" => "active",
                "worker_host" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
@@ -403,6 +406,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event_at" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
+             "passive" => nil,
              "retry" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
@@ -461,6 +465,49 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "phoenix observability api exposes passive issues without a running session" do
+    snapshot = %{
+      running: [],
+      passive: [
+        %{
+          issue_id: "issue-passive",
+          identifier: "MT-REVIEW",
+          state: "Human Review",
+          mode: "passive",
+          wait_reason: "human_review",
+          worker_host: nil,
+          workspace_path: "/tmp/symphony_workspaces/MT-REVIEW",
+          entered_passive_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      rate_limits: nil
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :PassiveObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: true, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state_payload["counts"] == %{"running" => 0, "passive" => 1, "retrying" => 0}
+
+    issue_payload = json_response(get(build_conn(), "/api/v1/MT-REVIEW"), 200)
+
+    assert issue_payload["status"] == "passive"
+    assert issue_payload["running"] == nil
+    assert issue_payload["retry"] == nil
+    assert issue_payload["passive"]["mode"] == "passive"
+    assert issue_payload["passive"]["wait_reason"] == "human_review"
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -641,7 +688,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "passive" => 0, "retrying" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

@@ -314,6 +314,7 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             passive: Map.get(snapshot, :passive, []),
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
@@ -333,6 +334,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_snapshot_content(snapshot_data, tps, terminal_columns_override \\ nil) do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
+        passive = Map.get(snapshot, :passive, [])
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
@@ -341,10 +343,28 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
+        passive_count = length(passive)
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
-        running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        passive_rows = format_passive_rows(passive)
+        running_to_passive_spacer = if(running != [] and passive_rows != [], do: ["│"], else: [])
+        passive_section = format_passive_section(passive_rows)
+
+        passive_to_backoff_spacer =
+          cond do
+            passive_rows != [] -> ["│"]
+            running != [] -> ["│"]
+            true -> []
+          end
+
+        waiting_line =
+          if passive_count > 0 do
+            [colorize("│ Waiting: ", @ansi_bold) <> colorize("#{passive_count}", @ansi_yellow)]
+          else
+            []
+          end
+
         backoff_rows = format_retry_rows(retrying)
 
         ([
@@ -370,8 +390,11 @@ defmodule SymphonyElixir.StatusDashboard do
            running_table_header_row(running_event_width),
            running_table_separator_row(running_event_width)
          ] ++
+           waiting_line ++
            running_rows ++
-           running_to_backoff_spacer ++
+           running_to_passive_spacer ++
+           passive_section ++
+           passive_to_backoff_spacer ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -559,6 +582,7 @@ defmodule SymphonyElixir.StatusDashboard do
           {:ok,
            %{
              running: running,
+             passive: Map.get(snapshot, :passive, []),
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
@@ -584,6 +608,39 @@ defmodule SymphonyElixir.StatusDashboard do
       |> Enum.sort_by(& &1.identifier)
       |> Enum.map(&format_running_summary(&1, running_event_width))
     end
+  end
+
+  defp format_passive_section([]), do: []
+
+  defp format_passive_section(passive_rows) do
+    [colorize("├─ Passive queue", @ansi_bold), "│"] ++ passive_rows
+  end
+
+  defp format_passive_rows(passive) do
+    passive
+    |> Enum.sort_by(& &1.identifier)
+    |> Enum.map(&format_passive_summary/1)
+  end
+
+  defp format_passive_summary(passive_entry) do
+    identifier = format_cell(passive_entry.identifier || "unknown", @running_id_width)
+    state = format_cell(to_string(passive_entry.state || "unknown"), @running_stage_width)
+    wait_reason = format_cell(to_string(passive_entry.wait_reason || "passive_wait"), 18)
+    workspace = truncate_plain(to_string(passive_entry.workspace_path || "n/a"), 36)
+
+    [
+      "│ ",
+      colorize("⏸", @ansi_yellow),
+      " ",
+      colorize(identifier, @ansi_cyan),
+      " ",
+      colorize(state, @ansi_yellow),
+      " ",
+      colorize(wait_reason, @ansi_magenta),
+      " ",
+      colorize(workspace, @ansi_gray)
+    ]
+    |> IO.iodata_to_binary()
   end
 
   # credo:disable-for-next-line

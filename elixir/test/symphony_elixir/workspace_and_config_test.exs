@@ -741,6 +741,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.passive_states == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
@@ -806,9 +807,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "writableRoots" => [explicit_workspace, explicit_cache]
            }
 
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_passive_states: ["Human Review"])
+    assert Config.settings!().tracker.passive_states == ["Human Review"]
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_passive_states: ",")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.passive_states"
 
     write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -832,6 +840,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
+      tracker_passive_states: %{review: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},
       workspace_root: 123,

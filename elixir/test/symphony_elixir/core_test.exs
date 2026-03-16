@@ -350,6 +350,75 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "passive issue state stops running agent without cleaning workspace and tracks wait metadata" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-passive-reconcile-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-passive"
+    issue_identifier = "MT-558"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "Rework", "Merging"],
+        tracker_passive_states: ["Human Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      File.mkdir_p!(test_root)
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            worker_host: nil,
+            workspace_path: workspace,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Human Review",
+        title: "Ready for approval",
+        description: "Waiting on a human",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+
+      assert %{identifier: ^issue_identifier, wait_reason: "human_review"} =
+               updated_state.passive[issue_id]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "missing running issues stop active agents without cleaning the workspace" do
     test_root =
       Path.join(

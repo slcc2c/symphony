@@ -15,9 +15,11 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
+            passive: length(Map.get(snapshot, :passive, [])),
             retrying: length(snapshot.retrying)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          passive: Enum.map(Map.get(snapshot, :passive, []), &passive_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
@@ -36,12 +38,13 @@ defmodule SymphonyElixirWeb.Presenter do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
+        passive = Enum.find(Map.get(snapshot, :passive, []), &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) do
+        if is_nil(running) and is_nil(passive) and is_nil(retry) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry)}
+          {:ok, issue_payload_body(issue_identifier, running, passive, retry)}
         end
 
       _ ->
@@ -60,20 +63,21 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  defp issue_payload_body(issue_identifier, running, passive, retry) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry),
-      status: issue_status(running, retry),
+      issue_id: issue_id_from_entries(running, passive, retry),
+      status: issue_status(running, passive, retry),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry),
-        host: workspace_host(running, retry)
+        path: workspace_path(issue_identifier, running, passive, retry),
+        host: workspace_host(running, passive, retry)
       },
       attempts: %{
         restart_count: restart_count(retry),
         current_retry_attempt: retry_attempt(retry)
       },
       running: running && running_issue_payload(running),
+      passive: passive && passive_issue_payload(passive),
       retry: retry && retry_issue_payload(retry),
       logs: %{
         codex_session_logs: []
@@ -84,22 +88,24 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_id_from_entries(running, retry),
-    do: (running && running.issue_id) || (retry && retry.issue_id)
+  defp issue_id_from_entries(running, passive, retry),
+    do: (running && running.issue_id) || (passive && passive.issue_id) || (retry && retry.issue_id)
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(_running, nil), do: "running"
-  defp issue_status(nil, _retry), do: "retrying"
-  defp issue_status(_running, _retry), do: "running"
+  defp issue_status(running, _passive, nil) when not is_nil(running), do: "running"
+  defp issue_status(nil, passive, nil) when not is_nil(passive), do: "passive"
+  defp issue_status(nil, _passive, _retry), do: "retrying"
+  defp issue_status(_running, _passive, _retry), do: "running"
 
   defp running_entry_payload(entry) do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       state: entry.state,
+      mode: Map.get(entry, :mode, "active"),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -113,6 +119,19 @@ defmodule SymphonyElixirWeb.Presenter do
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
       }
+    }
+  end
+
+  defp passive_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      state: entry.state,
+      mode: Map.get(entry, :mode, "passive"),
+      wait_reason: Map.get(entry, :wait_reason),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      entered_passive_at: iso8601(Map.get(entry, :entered_passive_at))
     }
   end
 
@@ -130,6 +149,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp running_issue_payload(running) do
     %{
+      mode: Map.get(running, :mode, "active"),
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
@@ -147,6 +167,17 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp passive_issue_payload(passive) do
+    %{
+      mode: Map.get(passive, :mode, "passive"),
+      worker_host: Map.get(passive, :worker_host),
+      workspace_path: Map.get(passive, :workspace_path),
+      state: passive.state,
+      wait_reason: Map.get(passive, :wait_reason),
+      entered_passive_at: iso8601(Map.get(passive, :entered_passive_at))
+    }
+  end
+
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
@@ -157,14 +188,17 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry) do
+  defp workspace_path(issue_identifier, running, passive, retry) do
     (running && Map.get(running, :workspace_path)) ||
+      (passive && Map.get(passive, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry) do
-    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
+  defp workspace_host(running, passive, retry) do
+    (running && Map.get(running, :worker_host)) ||
+      (passive && Map.get(passive, :worker_host)) ||
+      (retry && Map.get(retry, :worker_host))
   end
 
   defp recent_events_payload(running) do
